@@ -12,7 +12,7 @@ use std::{
     ops::Deref,
     pin::Pin,
     task::{Context, Poll},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -32,6 +32,7 @@ pub struct PendingTransaction<'a, P> {
     provider: &'a Provider<P>,
     state: PendingTxState<'a>,
     interval: Box<dyn Stream<Item = ()> + Send + Unpin>,
+    min_wait: Instant,
 }
 
 impl<'a, P: JsonRpcClient> PendingTransaction<'a, P> {
@@ -44,6 +45,7 @@ impl<'a, P: JsonRpcClient> PendingTransaction<'a, P> {
             provider,
             state: PendingTxState::InitialDelay(delay),
             interval: Box::new(interval(DEFAULT_POLL_INTERVAL)),
+            min_wait: Instant::now() + Duration::from_secs(20),
         }
     }
 
@@ -118,9 +120,12 @@ impl<'a, P: JsonRpcClient> Future for PendingTransaction<'a, P> {
             PendingTxState::GettingTx(fut) => {
                 let tx_res = futures_util::ready!(fut.as_mut().poll(ctx));
                 // If the provider errors, just try again after the interval.
-                // nbd.
+                // Also retry if we get None but haven't waited until min_wait yet.
+                // In some situations None can get returned immediately even if the tx
+                // will get successfully mined later.
+                // nbd. 
                 rewake_with_new_state_if!(
-                    tx_res.is_err(),
+                    tx_res.is_err() || tx_res.as_ref().unwrap().is_none() && Instant::now() < *this.min_wait,
                     ctx,
                     this,
                     PendingTxState::PausedGettingTx
