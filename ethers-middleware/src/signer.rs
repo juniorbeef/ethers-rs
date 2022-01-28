@@ -109,7 +109,7 @@ where
     }
 
     /// Signs and returns the RLP encoding of the signed transaction
-    async fn sign_transaction(
+    pub async fn sign_transaction(
         &self,
         tx: TypedTransaction,
     ) -> Result<Bytes, SignerMiddlewareError<M, S>> {
