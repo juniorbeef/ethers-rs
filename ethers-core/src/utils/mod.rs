@@ -318,9 +318,13 @@ pub fn eip1559_default_estimator(base_fee_per_gas: U256, rewards: Vec<Vec<U256>>
     (max_fee_per_gas, max_priority_fee_per_gas)
 }
 
-fn estimate_priority_fee(rewards: Vec<Vec<U256>>) -> U256 {
-    let mut rewards: Vec<U256> =
-        rewards.iter().map(|r| r[0]).filter(|r| *r > U256::zero()).collect();
+/// Estimate a priority fee based on rewards in past blocks
+pub fn estimate_priority_fee(rewards: Vec<Vec<U256>>) -> U256 {
+    let mut rewards: Vec<U256> = rewards
+        .iter()
+        .map(|r| r[0])
+        .filter(|r| *r > U256::zero())
+        .collect();
     if rewards.is_empty() {
         return U256::zero()
     }
@@ -364,7 +368,8 @@ fn estimate_priority_fee(rewards: Vec<Vec<U256>>) -> U256 {
     values[values.len() / 2]
 }
 
-fn base_fee_surged(base_fee_per_gas: U256) -> U256 {
+/// Estimate a rough upper bound for the base fee of the next block given the current one.
+pub fn base_fee_surged(base_fee_per_gas: U256) -> U256 {
     if base_fee_per_gas <= U256::from(40_000_000_000u64) {
         base_fee_per_gas * 2
     } else if base_fee_per_gas <= U256::from(100_000_000_000u64) {

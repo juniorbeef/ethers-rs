@@ -424,10 +424,26 @@ impl<P: JsonRpcClient> Middleware for Provider<P> {
     }
 
     /// Gets a heuristic recommendation of max fee per gas and max priority fee per gas for
-    /// EIP-1559 compatible transactions.
+    /// EIP-1559 compatible transactions using reasonable default parameters.
     async fn estimate_eip1559_fees(
         &self,
         estimator: Option<fn(U256, Vec<Vec<U256>>) -> (U256, U256)>,
+    ) -> Result<(U256, U256), Self::Error> {
+        self.estimate_eip1559_fees_full(
+            estimator,
+            utils::EIP1559_FEE_ESTIMATION_PAST_BLOCKS,
+            utils::EIP1559_FEE_ESTIMATION_REWARD_PERCENTILE
+        ).await
+    }
+
+    /// Gets a heuristic recommendation of max fee per gas and max priority fee per gas for
+    /// EIP-1559 compatible transactions, given the number of previous blocks to examine
+    /// and a percentile of previous priority fees to base the recommendation on.
+    async fn estimate_eip1559_fees_full(
+        &self,
+        estimator: Option<fn(U256, Vec<Vec<U256>>) -> (U256, U256)>,
+        num_past_blocks: u64,
+        reward_percentile: f64,
     ) -> Result<(U256, U256), Self::Error> {
         let base_fee_per_gas = self
             .get_block(BlockNumber::Latest)
@@ -438,9 +454,9 @@ impl<P: JsonRpcClient> Middleware for Provider<P> {
 
         let fee_history = self
             .fee_history(
-                utils::EIP1559_FEE_ESTIMATION_PAST_BLOCKS,
+                num_past_blocks,
                 BlockNumber::Latest,
-                &[utils::EIP1559_FEE_ESTIMATION_REWARD_PERCENTILE],
+                &[reward_percentile],
             )
             .await?;
 

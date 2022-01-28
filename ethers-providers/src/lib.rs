@@ -344,6 +344,18 @@ pub trait Middleware: Sync + Send + Debug {
         self.inner().get_gas_price().await.map_err(FromErr::from)
     }
 
+    async fn estimate_eip1559_fees_full(
+        &self,
+        estimator: Option<fn(U256, Vec<Vec<U256>>) -> (U256, U256)>,
+        num_past_blocks: u64,
+        reward_percentile: f64,
+    ) -> Result<(U256, U256), Self::Error> {
+        self.inner()
+            .estimate_eip1559_fees_full(estimator, num_past_blocks, reward_percentile)
+            .await
+            .map_err(FromErr::from)
+    }
+
     async fn estimate_eip1559_fees(
         &self,
         estimator: Option<fn(U256, Vec<Vec<U256>>) -> (U256, U256)>,
