@@ -287,7 +287,8 @@ impl<P: JsonRpcClient> Middleware for Provider<P> {
 
         // set the access lists
         if let Some(access_list) = tx.access_list() {
-            if access_list.0.is_empty() {
+            // but not if there is already a manual gas limit or access list
+            if access_list.0.is_empty() && tx.gas().is_none() {
                 if let Ok(al_with_gas) = self.create_access_list(tx, block).await {
                     // only set the access list if the used gas is less than the
                     // normally estimated gas
