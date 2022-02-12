@@ -4,16 +4,20 @@ use crate::{
     utils, CompilerInput, CompilerOutput,
 };
 use semver::{Version, VersionReq};
-use serde::{de::DeserializeOwned, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 use std::{
     fmt,
-    fmt::Formatter,
     io::BufRead,
     path::{Path, PathBuf},
     process::{Command, Output, Stdio},
     str::FromStr,
 };
+
+pub mod contracts;
+pub mod many;
+pub mod output;
+pub mod project;
 
 /// The name of the `solc` binary on the system
 pub const SOLC: &str = "solc";
@@ -168,7 +172,7 @@ impl From<SolcVersion> for Version {
 }
 
 impl fmt::Display for SolcVersion {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.as_ref())
     }
 }
@@ -181,7 +185,7 @@ impl fmt::Display for SolcVersion {
 ///   1. `SOLC_PATH` environment variable
 ///   2. [svm](https://github.com/roynalnaruto/svm-rs)'s  `global_version` (set via `svm use <version>`), stored at `<svm_home>/.global_version`
 ///   3. `solc` otherwise
-#[derive(Debug, Clone, Eq, PartialEq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Eq, PartialEq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct Solc {
     /// Path to the `solc` executable
     pub solc: PathBuf,
@@ -205,6 +209,16 @@ impl Default for Solc {
         }
 
         Solc::new(SOLC)
+    }
+}
+
+impl fmt::Display for Solc {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.solc.display())?;
+        if !self.args.is_empty() {
+            write!(f, " {}", self.args.join(" "))?;
+        }
+        Ok(())
     }
 }
 
@@ -409,14 +423,19 @@ impl Solc {
     #[cfg(feature = "svm")]
     pub async fn install(version: &Version) -> std::result::Result<(), svm::SolcVmError> {
         tracing::trace!("installing solc version \"{}\"", version);
-        svm::install(version).await
+        crate::report::solc_installation_start(version);
+        let result = svm::install(version).await;
+        crate::report::solc_installation_success(version);
+        result
     }
 
     /// Blocking version of `Self::install`
     #[cfg(all(feature = "svm", feature = "async"))]
     pub fn blocking_install(version: &Version) -> std::result::Result<(), svm::SolcVmError> {
         tracing::trace!("blocking installing solc version \"{}\"", version);
+        crate::report::solc_installation_start(version);
         tokio::runtime::Runtime::new().unwrap().block_on(svm::install(version))?;
+        crate::report::solc_installation_success(version);
         Ok(())
     }
 
@@ -456,6 +475,29 @@ impl Solc {
         self.compile(&CompilerInput::new(path)?)
     }
 
+    /// Same as [`Self::compile()`], but only returns those files which are included in the
+    /// `CompilerInput`.
+    ///
+    /// In other words, this removes those files from the `CompilerOutput` that are __not__ included
+    /// in the provided `CompilerInput`.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    ///  use ethers_solc::{CompilerInput, Solc};
+    /// let solc = Solc::default();
+    /// let input = CompilerInput::new("./contracts")?;
+    /// let output = solc.compile_exact(&input)?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn compile_exact(&self, input: &CompilerInput) -> Result<CompilerOutput> {
+        let mut out = self.compile(input)?;
+        out.retain_files(input.sources.keys().filter_map(|p| p.to_str()));
+        Ok(out)
+    }
+
     /// Run `solc --stand-json` and return the `solc`'s output as
     /// `CompilerOutput`
     ///
@@ -483,7 +525,6 @@ impl Solc {
 
     pub fn compile_output<T: Serialize>(&self, input: &T) -> Result<Vec<u8>> {
         let mut cmd = Command::new(&self.solc);
-
         let mut child = cmd
             .args(&self.args)
             .arg("--standard-json")
@@ -492,8 +533,7 @@ impl Solc {
             .stdout(Stdio::piped())
             .spawn()
             .map_err(|err| SolcError::io(err, &self.solc))?;
-        let stdin = child.stdin.take().unwrap();
-
+        let stdin = child.stdin.take().expect("Stdin exists.");
         serde_json::to_writer(stdin, input)?;
         compile_output(child.wait_with_output().map_err(|err| SolcError::io(err, &self.solc))?)
     }
@@ -599,7 +639,7 @@ impl Solc {
     /// let outputs = Solc::compile_many([(solc1, input1), (solc2, input2)], 2).await.flattened().unwrap();
     /// # }
     /// ```
-    pub async fn compile_many<I>(jobs: I, n: usize) -> CompiledMany
+    pub async fn compile_many<I>(jobs: I, n: usize) -> crate::many::CompiledMany
     where
         I: IntoIterator<Item = (Solc, CompilerInput)>,
     {
@@ -612,42 +652,8 @@ impl Solc {
         .buffer_unordered(n)
         .collect::<Vec<_>>()
         .await;
-        CompiledMany { outputs }
-    }
-}
 
-/// The result of a `solc` process bundled with its `Solc` and `CompilerInput`
-type CompileElement = (Result<CompilerOutput>, Solc, CompilerInput);
-
-/// The output of multiple `solc` processes.
-#[derive(Debug)]
-pub struct CompiledMany {
-    outputs: Vec<CompileElement>,
-}
-
-impl CompiledMany {
-    /// Returns an iterator over all output elements
-    pub fn outputs(&self) -> impl Iterator<Item = &CompileElement> {
-        self.outputs.iter()
-    }
-
-    /// Returns an iterator over all output elements
-    pub fn into_outputs(self) -> impl Iterator<Item = CompileElement> {
-        self.outputs.into_iter()
-    }
-
-    /// Returns all `CompilerOutput` or the first error that occurred
-    pub fn flattened(self) -> Result<Vec<CompilerOutput>> {
-        self.into_iter().collect()
-    }
-}
-
-impl IntoIterator for CompiledMany {
-    type Item = Result<CompilerOutput>;
-    type IntoIter = std::vec::IntoIter<Result<CompilerOutput>>;
-
-    fn into_iter(self) -> Self::IntoIter {
-        self.outputs.into_iter().map(|(res, _, _)| res).collect::<Vec<_>>().into_iter()
+        crate::many::CompiledMany::new(outputs)
     }
 }
 
@@ -713,17 +719,28 @@ mod tests {
 
     #[test]
     fn solc_compile_works() {
-        let input = include_str!("../test-data/in/compiler-in-1.json");
+        let input = include_str!("../../test-data/in/compiler-in-1.json");
         let input: CompilerInput = serde_json::from_str(input).unwrap();
         let out = solc().compile(&input).unwrap();
         let other = solc().compile(&serde_json::json!(input)).unwrap();
         assert_eq!(out, other);
     }
 
+    #[test]
+    fn solc_metadata_works() {
+        let input = include_str!("../../test-data/in/compiler-in-1.json");
+        let mut input: CompilerInput = serde_json::from_str(input).unwrap();
+        input.settings.push_output_selection("metadata");
+        let out = solc().compile(&input).unwrap();
+        for (_, c) in out.split().1.contracts_iter() {
+            assert!(c.metadata.is_some());
+        }
+    }
+
     #[cfg(feature = "async")]
     #[tokio::test]
     async fn async_solc_compile_works() {
-        let input = include_str!("../test-data/in/compiler-in-1.json");
+        let input = include_str!("../../test-data/in/compiler-in-1.json");
         let input: CompilerInput = serde_json::from_str(input).unwrap();
         let out = solc().async_compile(&input).await.unwrap();
         let other = solc().async_compile(&serde_json::json!(input)).await.unwrap();
@@ -732,7 +749,7 @@ mod tests {
     #[cfg(feature = "async")]
     #[tokio::test]
     async fn async_solc_compile_works2() {
-        let input = include_str!("../test-data/in/compiler-in-2.json");
+        let input = include_str!("../../test-data/in/compiler-in-2.json");
         let input: CompilerInput = serde_json::from_str(input).unwrap();
         let out = solc().async_compile(&input).await.unwrap();
         let other = solc().async_compile(&serde_json::json!(input)).await.unwrap();

@@ -4,6 +4,7 @@
 
 ### Unreleased
 
+- Add `eth_syncing` [848](https://github.com/gakonst/ethers-rs/pull/848)
 - Fix overflow and possible divide-by-zero in `estimate_priority_fee`
 - Add BSC mainnet and testnet to the list of known chains
   [831](https://github.com/gakonst/ethers-rs/pull/831)
@@ -23,6 +24,16 @@
   and no nonce is specified
 - Move `fill_transaction` implementation to the provider, to allow middleware
   to properly override its behavior.
+- Add informational messages to solc installation and compilation.
+- Significantly refactor `MultiAbigen` module generation. Now allows for lib
+  generation, and does not make unnecessary disk writes.
+  [#854](https://github.com/gakonst/ethers-rs/pull/852)
+- Refactor `ethers-contract-abigen` to use `eyre` instead of `anyhow` via
+  [#858](https://github.com/gakonst/ethers-rs/pull/858)
+- Add `Deployer.send_with_receipt -> Result<(Contract, Receipt), Error>`
+  so that the receipt can be returned to the called when deploying
+  a contract [#865](https://github.com/gakonst/ethers-rs/pull/865)
+- Add Arbitrum mainnet and testnet to the list of known chains
 
 ## ethers-contract-abigen
 
@@ -37,6 +48,12 @@
 
 ### Unreleased
 
+- Total revamp of the `Project::compile` pipeline
+  [#802](https://github.com/gakonst/ethers-rs/pull/802)
+  - Support multiple versions of compiled contracts
+  - Breaking: deprecate hardhat cache file compatibility, cache file now tracks artifact paths and their versions
+- Fix flatten replacement target location
+  [#846](https://github.com/gakonst/ethers-rs/pull/846)
 - Fix duplicate files during flattening
   [#813](https://github.com/gakonst/ethers-rs/pull/813)
 - Add ability to flatten file imports
@@ -101,6 +118,7 @@
   [640](https://github.com/gakonst/ethers-rs/pull/640)
 
 ### Unreleased
+
 - Add support for basic and bearer authentication in http and non-wasm websockets.
   [829](https://github.com/gakonst/ethers-rs/pull/829)
 
@@ -179,6 +197,7 @@
   [#568](https://github.com/gakonst/ethers-rs/pull/568)
 - Removes GasNow as a gas price oracle
   [#508](https://github.com/gakonst/ethers-rs/pull/508)
+- add initialize_nonce public function to initialize NonceMiddleManager
 
 ### 0.5.3
 

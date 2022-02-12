@@ -14,6 +14,26 @@
 //! Finding all dependencies is fairly simple, we're simply doing a DFS, starting the source
 //! contracts
 //!
+//! ## Solc version auto-detection
+//!
+//! Solving a constraint graph is an NP-hard problem. The algorithm for finding the "best" solution
+//! makes several assumptions and tries to find a version of "Solc" that is compatible with all
+//! source files.
+//!
+//! The algorithm employed here is fairly simple, we simply do a DFS over all the source files and
+//! find the set of Solc versions that the file and all its imports are compatible with, and then we
+//! try to find a single Solc version that is compatible with all the files. This is effectively the
+//! intersection of all version sets.
+//!
+//! We always try to activate the highest (installed) solc version first. Uninstalled solc is only
+//! used if this version is the only compatible version for a single file or in the intersection of
+//! all version sets.
+//!
+//! This leads to finding the optimal version, if there is one. If there is no single Solc version
+//! that is compatible with all sources and their imports, then suddenly this becomes a very
+//! difficult problem, because what would be the "best" solution. In this case, just choose the
+//! latest (installed) Solc version and try to minimize the number of Solc versions used.
+//!
 //! ## Performance
 //!
 //! Note that this is a relatively performance-critical portion of the ethers-solc preprocessing.
@@ -36,7 +56,64 @@ use regex::Match;
 use semver::VersionReq;
 use solang_parser::pt::{Import, Loc, SourceUnitPart};
 
-use crate::{error::Result, utils, ProjectPathsConfig, Solc, Source, Sources};
+use crate::{error::Result, utils, ProjectPathsConfig, Solc, SolcError, Source, Sources};
+
+/// The underlying edges of the graph which only contains the raw relationship data.
+///
+/// This is kept separate from the `Graph` as the `Node`s get consumed when the `Solc` to `Sources`
+/// set is determined.
+#[derive(Debug, Clone)]
+pub struct GraphEdges {
+    /// The indices of `edges` correspond to the `nodes`. That is, `edges[0]`
+    /// is the set of outgoing edges for `nodes[0]`.
+    edges: Vec<Vec<usize>>,
+    /// index maps for a solidity file to an index, for fast lookup.
+    indices: HashMap<PathBuf, usize>,
+    /// reverse of `indices` for reverse lookup
+    rev_indices: HashMap<usize, PathBuf>,
+    /// the identified version requirement of a file
+    versions: HashMap<usize, Option<VersionReq>>,
+    /// with how many input files we started with, corresponds to `let input_files =
+    /// nodes[..num_input_files]`.
+    ///
+    /// Combined with the `indices` this way we can determine if a file was original added to the
+    /// graph as input or was added as resolved import, see [`Self::is_input_file()`]
+    num_input_files: usize,
+}
+
+impl GraphEdges {
+    /// Returns a list of nodes the given node index points to for the given kind.
+    pub fn imported_nodes(&self, from: usize) -> &[usize] {
+        &self.edges[from]
+    }
+
+    /// Returns all files imported by the given file
+    pub fn imports(&self, file: impl AsRef<Path>) -> HashSet<&PathBuf> {
+        if let Some(start) = self.indices.get(file.as_ref()).copied() {
+            NodesIter::new(start, self).skip(1).map(move |idx| &self.rev_indices[&idx]).collect()
+        } else {
+            HashSet::new()
+        }
+    }
+
+    /// Returns true if the `file` was originally included when the graph was first created and not
+    /// added when all `imports` were resolved
+    pub fn is_input_file(&self, file: impl AsRef<Path>) -> bool {
+        if let Some(idx) = self.indices.get(file.as_ref()).copied() {
+            idx < self.num_input_files
+        } else {
+            false
+        }
+    }
+
+    /// Returns the `VersionReq` for the given file
+    pub fn version_requirement(&self, file: impl AsRef<Path>) -> Option<&VersionReq> {
+        self.indices
+            .get(file.as_ref())
+            .and_then(|idx| self.versions.get(idx))
+            .and_then(|v| v.as_ref())
+    }
+}
 
 /// Represents a fully-resolved solidity dependency graph. Each node in the graph
 /// is a file and edges represent dependencies between them.
@@ -44,14 +121,8 @@ use crate::{error::Result, utils, ProjectPathsConfig, Solc, Source, Sources};
 #[derive(Debug)]
 pub struct Graph {
     nodes: Vec<Node>,
-    /// The indices of `edges` correspond to the `nodes`. That is, `edges[0]`
-    /// is the set of outgoing edges for `nodes[0]`.
-    edges: Vec<Vec<usize>>,
-    /// index maps for a solidity file to an index, for fast lookup.
-    indices: HashMap<PathBuf, usize>,
-    /// with how many input files we started with, corresponds to `let input_files =
-    /// nodes[..num_input_files]`.
-    num_input_files: usize,
+    /// relationship of the nodes
+    edges: GraphEdges,
     /// the root of the project this graph represents
     #[allow(unused)]
     root: PathBuf,
@@ -60,15 +131,19 @@ pub struct Graph {
 impl Graph {
     /// Returns a list of nodes the given node index points to for the given kind.
     pub fn imported_nodes(&self, from: usize) -> &[usize] {
-        &self.edges[from]
+        self.edges.imported_nodes(from)
     }
 
     /// Returns all the resolved files and their index in the graph
     pub fn files(&self) -> &HashMap<PathBuf, usize> {
-        &self.indices
+        &self.edges.indices
     }
 
     /// Gets a node by index.
+    ///
+    /// # Panics
+    ///
+    /// if the `index` node id is not included in the graph
     pub fn node(&self, index: usize) -> &Node {
         &self.nodes[index]
     }
@@ -80,7 +155,7 @@ impl Graph {
     ///
     /// if the `start` node id is not included in the graph
     pub fn node_ids(&self, start: usize) -> impl Iterator<Item = usize> + '_ {
-        NodesIter::new(start, self)
+        NodesIter::new(start, &self.edges)
     }
 
     /// Same as `Self::node_ids` but returns the actual `Node`
@@ -88,16 +163,22 @@ impl Graph {
         self.node_ids(start).map(move |idx| self.node(idx))
     }
 
-    /// Returns all files together with their paths
-    pub fn into_sources(self) -> Sources {
-        self.nodes.into_iter().map(|node| (node.path, node.source)).collect()
+    /// Consumes the `Graph`, effectively splitting the `nodes` and the `GraphEdges` off and
+    /// returning the `nodes` converted to `Sources`
+    pub fn into_sources(self) -> (Sources, GraphEdges) {
+        let Graph { nodes, edges, .. } = self;
+        (nodes.into_iter().map(|node| (node.path, node.source)).collect(), edges)
     }
 
     /// Returns an iterator that yields only those nodes that represent input files.
     /// See `Self::resolve_sources`
     /// This won't yield any resolved library nodes
     pub fn input_nodes(&self) -> impl Iterator<Item = &Node> {
-        self.nodes.iter().take(self.num_input_files)
+        self.nodes.iter().take(self.edges.num_input_files)
+    }
+
+    pub fn imports(&self, path: impl AsRef<Path>) -> HashSet<&PathBuf> {
+        self.edges.imports(path)
     }
 
     /// Resolves a number of sources within the given config
@@ -129,7 +210,7 @@ impl Graph {
         let mut unresolved: VecDeque<(PathBuf, Node)> = sources
             .into_par_iter()
             .map(|(path, source)| {
-                let data = parse_data(source.as_ref());
+                let data = parse_data(source.as_ref(), &path);
                 (path.clone(), Node { path, source, data })
             })
             .collect();
@@ -164,8 +245,18 @@ impl Graph {
             nodes.push(node);
             edges.push(resolved_imports);
         }
-
-        Ok(Graph { nodes, edges, indices: index, num_input_files, root: paths.root.clone() })
+        let edges = GraphEdges {
+            edges,
+            rev_indices: index.iter().map(|(k, v)| (*v, k.clone())).collect(),
+            indices: index,
+            num_input_files,
+            versions: nodes
+                .iter()
+                .enumerate()
+                .map(|(idx, node)| (idx, node.data.version_req.clone()))
+                .collect(),
+        };
+        Ok(Graph { nodes, edges, root: paths.root.clone() })
     }
 
     /// Resolves the dependencies of a project's source contracts
@@ -176,11 +267,12 @@ impl Graph {
 
 #[cfg(all(feature = "svm", feature = "async"))]
 impl Graph {
-    /// Returns all input files together with their appropriate version.
+    /// Consumes the nodes of the graph and returns all input files together with their appropriate
+    /// version and the edges of the graph
     ///
     /// First we determine the compatible version for each input file (from sources and test folder,
     /// see `Self::resolve`) and then we add all resolved library imports.
-    pub fn into_sources_by_version(self, offline: bool) -> Result<VersionedSources> {
+    pub fn into_sources_by_version(self, offline: bool) -> Result<(VersionedSources, GraphEdges)> {
         /// insert the imports of the given node into the sources map
         /// There can be following graph:
         /// `A(<=0.8.10) imports C(>0.4.0)` and `B(0.8.11) imports C(>0.4.0)`
@@ -209,7 +301,7 @@ impl Graph {
         }
 
         let versioned_nodes = self.get_input_node_versions(offline)?;
-        let Self { nodes, edges, num_input_files, .. } = self;
+        let Self { nodes, edges, .. } = self;
         let mut versioned_sources = HashMap::with_capacity(versioned_nodes.len());
         let mut all_nodes = nodes.into_iter().enumerate().collect::<HashMap<_, _>>();
 
@@ -221,11 +313,17 @@ impl Graph {
                 // insert the input node in the sources set and remove it from the available set
                 let node = all_nodes.remove(&idx).expect("node is preset. qed");
                 sources.insert(node.path, node.source);
-                insert_imports(idx, &mut all_nodes, &mut sources, &edges, num_input_files);
+                insert_imports(
+                    idx,
+                    &mut all_nodes,
+                    &mut sources,
+                    &edges.edges,
+                    edges.num_input_files,
+                );
             }
             versioned_sources.insert(version, sources);
         }
-        Ok(VersionedSources { inner: versioned_sources, offline })
+        Ok((VersionedSources { inner: versioned_sources, offline }, edges))
     }
 
     /// Writes the list of imported files into the given formatter:
@@ -236,19 +334,14 @@ impl Graph {
         f: &mut W,
     ) -> std::result::Result<(), std::fmt::Error> {
         let node = self.node(idx);
-        for dep in self.imported_nodes(idx) {
-            let dep = self.node(*dep);
-            writeln!(
-                f,
-                "  {} ({:?}) imports {} ({:?})",
-                utils::source_name(&node.path, &self.root).display(),
-                node.data.version,
-                utils::source_name(&dep.path, &self.root).display(),
-                dep.data.version
-            )?;
-        }
-        for dep in self.imported_nodes(idx) {
-            self.format_imports_list(*dep, f)?;
+        write!(f, "{} ", utils::source_name(&node.path, &self.root).display(),)?;
+        node.data.fmt_version(f)?;
+        write!(f, " imports:",)?;
+        for dep in self.node_ids(idx).skip(1) {
+            writeln!(f)?;
+            let dep = self.node(dep);
+            write!(f, "    {} ", utils::source_name(&dep.path, &self.root).display())?;
+            dep.data.fmt_version(f)?;
         }
 
         Ok(())
@@ -294,16 +387,22 @@ impl Graph {
         // on first error, instead gather all the errors and return a bundled error message instead
         let mut errors = Vec::new();
         // we also  don't want duplicate error diagnostic
-        let mut erroneous_nodes = std::collections::HashSet::with_capacity(self.num_input_files);
+        let mut erroneous_nodes =
+            std::collections::HashSet::with_capacity(self.edges.num_input_files);
 
+        // the sorted list of all versions
         let all_versions = if offline { Solc::installed_versions() } else { Solc::all_versions() };
 
-        // stores all versions and their nodes
+        // stores all versions and their nodes that can be compiled
         let mut versioned_nodes = HashMap::new();
 
+        // stores all files and the versions they're compatible with
+        let mut all_candidates = Vec::with_capacity(self.edges.num_input_files);
         // walking through the node's dep tree and filtering the versions along the way
-        for idx in 0..self.num_input_files {
+        for idx in 0..self.edges.num_input_files {
             let mut candidates = all_versions.iter().collect::<Vec<_>>();
+            // remove all incompatible versions from the candidates list by checking the node and
+            // all its imports
             self.retain_compatible_versions(idx, &mut candidates);
 
             if candidates.is_empty() && !erroneous_nodes.contains(&idx) {
@@ -315,15 +414,33 @@ impl Graph {
                 ));
                 erroneous_nodes.insert(idx);
             } else {
-                let candidate = (*candidates
-                    .iter()
-                    .rev()
-                    .find(|v| v.is_installed())
-                    .or_else(|| candidates.iter().last())
-                    .unwrap())
-                .clone();
+                // found viable candidates, pick the most recent version that's already installed
+                let candidate =
+                    if let Some(pos) = candidates.iter().rposition(|v| v.is_installed()) {
+                        candidates[pos]
+                    } else {
+                        candidates.last().expect("not empty; qed.")
+                    }
+                    .clone();
+
+                // also store all possible candidates to optimize the set
+                all_candidates.push((idx, candidates.into_iter().collect::<HashSet<_>>()));
+
                 versioned_nodes.entry(candidate).or_insert_with(|| Vec::with_capacity(1)).push(idx);
             }
+        }
+
+        // detected multiple versions but there might still exist a single version that satisfies
+        // all sources
+        if versioned_nodes.len() > 1 {
+            versioned_nodes = Self::resolve_multiple_versions(all_candidates);
+        }
+
+        if versioned_nodes.len() == 1 {
+            tracing::trace!(
+                "found exact solc version for all sources  \"{}\"",
+                versioned_nodes.keys().next().unwrap()
+            );
         }
 
         if errors.is_empty() {
@@ -335,8 +452,92 @@ impl Graph {
             Ok(versioned_nodes)
         } else {
             tracing::error!("failed to resolve versions");
-            Err(crate::error::SolcError::msg(errors.join("\n")))
+            Err(SolcError::msg(errors.join("\n")))
         }
+    }
+
+    /// Tries to find the "best" set of versions to nodes, See [Solc version
+    /// auto-detection](#solc-version-auto-detection)
+    ///
+    /// This is a bit inefficient but is fine, the max. number of versions is ~80 and there's
+    /// a high chance that the number of source files is <50, even for larger projects.
+    fn resolve_multiple_versions(
+        all_candidates: Vec<(usize, HashSet<&crate::SolcVersion>)>,
+    ) -> HashMap<crate::SolcVersion, Vec<usize>> {
+        // returns the intersection as sorted set of nodes
+        fn intersection<'a>(
+            mut sets: Vec<&HashSet<&'a crate::SolcVersion>>,
+        ) -> Vec<&'a crate::SolcVersion> {
+            if sets.is_empty() {
+                return Vec::new()
+            }
+
+            let mut result = sets.pop().cloned().expect("not empty; qed.").clone();
+            if sets.len() > 1 {
+                result.retain(|item| sets.iter().all(|set| set.contains(item)));
+            }
+
+            let mut v = result.into_iter().collect::<Vec<_>>();
+            v.sort_unstable();
+            v
+        }
+
+        /// returns the highest version that is installed
+        /// if the candidates set only contains uninstalled versions then this returns the highest
+        /// uninstalled version
+        fn remove_candidate(candidates: &mut Vec<&crate::SolcVersion>) -> crate::SolcVersion {
+            debug_assert!(!candidates.is_empty());
+
+            if let Some(pos) = candidates.iter().rposition(|v| v.is_installed()) {
+                candidates.remove(pos)
+            } else {
+                candidates.pop().expect("not empty; qed.")
+            }
+            .clone()
+        }
+
+        let all_sets = all_candidates.iter().map(|(_, versions)| versions).collect();
+
+        // find all versions that satisfy all nodes
+        let mut intersection = intersection(all_sets);
+        if !intersection.is_empty() {
+            let exact_version = remove_candidate(&mut intersection);
+            let all_nodes = all_candidates.into_iter().map(|(node, _)| node).collect();
+            tracing::trace!(
+                "resolved solc version compatible with all sources  \"{}\"",
+                exact_version
+            );
+            return HashMap::from([(exact_version, all_nodes)])
+        }
+
+        // no version satisfies all nodes
+        let mut versioned_nodes: HashMap<crate::SolcVersion, Vec<usize>> = HashMap::new();
+
+        // try to minimize the set of versions, this is guaranteed to lead to `versioned_nodes.len()
+        // > 1` as no solc version exists that can satisfy all sources
+        for (node, versions) in all_candidates {
+            // need to sort them again
+            let mut versions = versions.into_iter().collect::<Vec<_>>();
+            versions.sort_unstable();
+
+            let candidate =
+                if let Some(idx) = versions.iter().rposition(|v| versioned_nodes.contains_key(v)) {
+                    // use a version that's already in the set
+                    versions.remove(idx).clone()
+                } else {
+                    // use the highest version otherwise
+                    remove_candidate(&mut versions)
+                };
+
+            versioned_nodes.entry(candidate).or_insert_with(|| Vec::with_capacity(1)).push(node);
+        }
+
+        tracing::trace!(
+            "no solc version can satisfy all source files, resolved multiple versions  \"{:?}\"",
+            versioned_nodes.keys()
+        );
+
+        versioned_nodes
     }
 }
 
@@ -346,12 +547,12 @@ pub struct NodesIter<'a> {
     /// stack of nodes
     stack: VecDeque<usize>,
     visited: HashSet<usize>,
-    graph: &'a Graph,
+    graph: &'a GraphEdges,
 }
 
 impl<'a> NodesIter<'a> {
-    fn new(start: usize, graph: &'a Graph) -> Self {
-        Self { stack: VecDeque::from([start]), visited: Default::default(), graph }
+    fn new(start: usize, graph: &'a GraphEdges) -> Self {
+        Self { stack: VecDeque::from([start]), visited: HashSet::new(), graph }
     }
 }
 
@@ -382,9 +583,7 @@ impl VersionedSources {
     pub fn get(
         self,
         allowed_lib_paths: &crate::AllowedLibPaths,
-    ) -> Result<std::collections::BTreeMap<Solc, Sources>> {
-        use crate::SolcError;
-
+    ) -> Result<std::collections::BTreeMap<Solc, (semver::Version, Sources)>> {
         // we take the installer lock here to ensure installation checking is done in sync
         #[cfg(any(test, feature = "tests"))]
         let _lock = crate::compile::take_solc_installer_lock();
@@ -411,8 +610,9 @@ impl VersionedSources {
                 Solc::blocking_install(version.as_ref())?;
                 tracing::trace!("reinstalled solc: \"{}\"", version);
             }
-            sources_by_version
-                .insert(solc.arg("--allow-paths").arg(allowed_lib_paths.to_string()), sources);
+            let solc = solc.arg("--allow-paths").arg(allowed_lib_paths.to_string());
+            let version = solc.version()?;
+            sources_by_version.insert(solc, (version, sources));
         }
         Ok(sources_by_version)
     }
@@ -452,6 +652,19 @@ struct SolData {
     version_req: Option<VersionReq>,
 }
 
+impl SolData {
+    #[allow(unused)]
+    fn fmt_version<W: std::fmt::Write>(
+        &self,
+        f: &mut W,
+    ) -> std::result::Result<(), std::fmt::Error> {
+        if let Some(ref version) = self.version {
+            write!(f, "({})", version.data)?;
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct SolDataUnit<T> {
     loc: Location,
@@ -485,7 +698,8 @@ impl<T> SolDataUnit<T> {
     pub fn loc_by_offset(&self, offset: isize) -> (usize, usize) {
         (
             offset.saturating_add(self.loc.start as isize) as usize,
-            offset.saturating_add(self.loc.end as isize) as usize,
+            // make the end location exclusive
+            offset.saturating_add(self.loc.end as isize + 1) as usize,
         )
     }
 }
@@ -504,8 +718,8 @@ impl From<Loc> for Location {
 
 fn read_node(file: impl AsRef<Path>) -> Result<Node> {
     let file = file.as_ref();
-    let source = Source::read(file)?;
-    let data = parse_data(source.as_ref());
+    let source = Source::read(file).map_err(SolcError::Resolve)?;
+    let data = parse_data(source.as_ref(), file);
     Ok(Node { path: file.to_path_buf(), source, data })
 }
 
@@ -513,11 +727,11 @@ fn read_node(file: impl AsRef<Path>) -> Result<Node> {
 ///
 /// This will attempt to parse the solidity AST and extract the imports and version pragma. If
 /// parsing fails, we'll fall back to extract that info via regex
-fn parse_data(content: &str) -> SolData {
+fn parse_data(content: &str, file: &Path) -> SolData {
     let mut version = None;
     let mut imports = Vec::<SolDataUnit<PathBuf>>::new();
     match solang_parser::parse(content, 0) {
-        Ok(units) => {
+        Ok((units, _)) => {
             for unit in units.0 {
                 match unit {
                     SourceUnitPart::PragmaDirective(loc, _, pragma, value) => {
@@ -540,7 +754,8 @@ fn parse_data(content: &str) -> SolData {
         }
         Err(err) => {
             tracing::trace!(
-                "failed to parse solidity ast: \"{:?}\". Falling back to regex to extract data",
+                "failed to parse \"{}\" ast: \"{:?}\". Falling back to regex to extract data",
+                file.display(),
                 err
             );
             version = capture_outer_and_inner(content, &utils::RE_SOL_PRAGMA_VERSION, &["version"])
@@ -548,9 +763,8 @@ fn parse_data(content: &str) -> SolData {
                 .map(|(cap, name)| {
                     SolDataUnit::new(name.as_str().to_owned(), cap.to_owned().into())
                 });
-            imports = capture_outer_and_inner(content, &utils::RE_SOL_IMPORT, &["p1", "p2", "p3"])
-                .iter()
-                .map(|(cap, m)| SolDataUnit::new(PathBuf::from(m.as_str()), cap.to_owned().into()))
+            imports = utils::find_import_paths(content)
+                .map(|m| SolDataUnit::new(PathBuf::from(m.as_str()), m.to_owned().into()))
                 .collect();
         }
     };
@@ -595,7 +809,7 @@ mod tests {
 
         let graph = Graph::resolve(&paths).unwrap();
 
-        assert_eq!(graph.num_input_files, 1);
+        assert_eq!(graph.edges.num_input_files, 1);
         assert_eq!(graph.files().len(), 2);
 
         assert_eq!(
@@ -614,7 +828,7 @@ mod tests {
 
         let graph = Graph::resolve(&paths).unwrap();
 
-        assert_eq!(graph.num_input_files, 2);
+        assert_eq!(graph.edges.num_input_files, 2);
         assert_eq!(graph.files().len(), 3);
         assert_eq!(
             graph.files().clone(),

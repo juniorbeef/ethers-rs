@@ -79,6 +79,15 @@ where
     }
 }
 
+/// Structure used in eth_syncing RPC
+#[derive(Clone, Debug)]
+pub enum SyncingStatus {
+    /// When client is synced to highest block, eth_syncing with return string "false"
+    IsFalse,
+    /// When client is still syncing past blocks we get IsSyncing information.
+    IsSyncing { starting_block: U256, current_block: U256, highest_block: U256 },
+}
+
 /// A middleware allows customizing requests send and received from an ethereum node.
 ///
 /// Writing a middleware is as simple as:
@@ -168,6 +177,7 @@ pub trait Middleware: Sync + Send + Debug {
     /// 4. Estimate gas usage _with_ access lists
     /// 5. Enable access lists IFF they are cheaper
     /// 6. Poll and set legacy or 1559 gas prices
+    /// 7. Set the chain_id with the provider's, if not already set
     ///
     /// It does NOT set the nonce by default.
     /// It MAY override the gas amount set by the user, if access lists are
@@ -223,7 +233,6 @@ pub trait Middleware: Sync + Send + Debug {
         }
 
         let gas_price = original.gas_price().expect("filled");
-        let chain_id = self.get_chainid().await?.low_u64();
         let sign_futs: Vec<_> = (0..escalations)
             .map(|i| {
                 let new_price = policy(gas_price, i);
@@ -234,7 +243,7 @@ pub trait Middleware: Sync + Send + Debug {
             .map(|req| async move {
                 self.sign_transaction(&req, self.default_sender().unwrap_or_default())
                     .await
-                    .map(|sig| req.rlp_signed(chain_id, &sig))
+                    .map(|sig| req.rlp_signed(&sig))
             })
             .collect();
 
@@ -301,6 +310,10 @@ pub trait Middleware: Sync + Send + Debug {
         block: Option<BlockId>,
     ) -> Result<Bytes, Self::Error> {
         self.inner().call(tx, block).await.map_err(FromErr::from)
+    }
+
+    async fn syncing(&self) -> Result<SyncingStatus, Self::Error> {
+        self.inner().syncing().await.map_err(FromErr::from)
     }
 
     async fn get_chainid(&self) -> Result<U256, Self::Error> {

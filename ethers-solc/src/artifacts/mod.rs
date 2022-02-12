@@ -5,7 +5,7 @@ use colored::Colorize;
 use md5::Digest;
 use semver::Version;
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashSet},
     convert::TryFrom,
     fmt, fs,
     path::{Path, PathBuf},
@@ -22,10 +22,24 @@ use crate::{
 use ethers_core::abi::Address;
 use serde::{de::Visitor, Deserialize, Deserializer, Serialize, Serializer};
 
+pub mod output_selection;
+pub mod serde_helpers;
+pub use serde_helpers::{deserialize_bytes, deserialize_opt_bytes};
+
+/// Solidity files are made up of multiple `source units`, a solidity contract is such a `source
+/// unit`, therefore a solidity file can contain multiple contracts: (1-N*) relationship.
+///
+/// This types represents this mapping as `file name -> (contract name -> T)`, where the generic is
+/// intended to represent contract specific information, like [`Contract`] itself, See [`Contracts`]
+pub type FileToContractsMap<T> = BTreeMap<String, BTreeMap<String, T>>;
+
+/// file -> (contract name -> Contract)
+pub type Contracts = FileToContractsMap<Contract>;
+
 /// An ordered list of files and their source
 pub type Sources = BTreeMap<PathBuf, Source>;
 
-pub type Contracts = BTreeMap<String, BTreeMap<String, Contract>>;
+pub type VersionedSources = BTreeMap<Solc, (Version, Sources)>;
 
 /// Input type `solc` expects
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -93,9 +107,14 @@ impl Default for CompilerInput {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Settings {
+    /// Stop compilation after the given stage.
+    /// since 0.8.11: only "parsing" is valid here
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_after: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub remappings: Vec<Remapping>,
     pub optimizer: Optimizer,
+    /// Metadata settings
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata: Option<SettingsMetadata>,
     /// This field can be used to select desired outputs based
@@ -165,28 +184,100 @@ pub struct Settings {
     /// ```
     #[serde(default)]
     pub output_selection: BTreeMap<String, BTreeMap<String, Vec<String>>>,
-    #[serde(default, with = "display_from_str_opt", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        with = "serde_helpers::display_from_str_opt",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub evm_version: Option<EvmVersion>,
     #[serde(default, skip_serializing_if = "::std::collections::BTreeMap::is_empty")]
     pub libraries: BTreeMap<String, BTreeMap<String, String>>,
 }
 
 impl Settings {
+    /// Creates a new `Settings` instance with the given `output_selection`
+    pub fn new(output_selection: BTreeMap<String, BTreeMap<String, Vec<String>>>) -> Self {
+        Self { output_selection, ..Default::default() }
+    }
+
+    /// select all outputs the compiler can possibly generate, use
+    /// `{ "*": { "*": [ "*" ], "": [ "*" ] } }`
+    /// but note that this might slow down the compilation process needlessly.
+    pub fn complete_output_selection() -> BTreeMap<String, BTreeMap<String, Vec<String>>> {
+        BTreeMap::from([(
+            "*".to_string(),
+            BTreeMap::from([
+                ("*".to_string(), vec!["*".to_string()]),
+                ("".to_string(), vec!["*".to_string()]),
+            ]),
+        )])
+    }
+
     /// Default output selection for compiler output
     pub fn default_output_selection() -> BTreeMap<String, BTreeMap<String, Vec<String>>> {
-        let mut output_selection = BTreeMap::default();
-        let mut output = BTreeMap::default();
-        output.insert(
+        BTreeMap::from([(
             "*".to_string(),
-            vec![
-                "abi".to_string(),
-                "evm.bytecode".to_string(),
-                "evm.deployedBytecode".to_string(),
-                "evm.methodIdentifiers".to_string(),
-            ],
-        );
-        output_selection.insert("*".to_string(), output);
-        output_selection
+            BTreeMap::from([(
+                "*".to_string(),
+                vec![
+                    "abi".to_string(),
+                    "evm.bytecode".to_string(),
+                    "evm.deployedBytecode".to_string(),
+                    "evm.methodIdentifiers".to_string(),
+                ],
+            )]),
+        )])
+    }
+
+    /// Inserts the value for all files and contracts
+    ///
+    /// ```
+    /// use ethers_solc::artifacts::output_selection::ContractOutputSelection;
+    /// use ethers_solc::artifacts::Settings;
+    /// let mut selection = Settings::default();
+    /// selection.push_output_selection(ContractOutputSelection::Metadata);
+    /// ```
+    pub fn push_output_selection(&mut self, value: impl ToString) {
+        self.push_contract_output_selection("*", value)
+    }
+
+    /// Inserts the `key` `value` pair to the `output_selection` for all files
+    ///
+    /// If the `key` already exists, then the value is added to the existing list
+    pub fn push_contract_output_selection(
+        &mut self,
+        contracts: impl Into<String>,
+        value: impl ToString,
+    ) {
+        let value = value.to_string();
+        let values = self
+            .output_selection
+            .entry("*".to_string())
+            .or_default()
+            .entry(contracts.into())
+            .or_default();
+        if !values.contains(&value) {
+            values.push(value)
+        }
+    }
+
+    /// Sets the value for all files and contracts
+    pub fn set_output_selection(&mut self, values: impl IntoIterator<Item = impl ToString>) {
+        self.set_contract_output_selection("*", values)
+    }
+
+    /// Sets the `key` to the `values` pair to the `output_selection` for all files
+    ///
+    /// This will replace the existing values for `key` if they're present
+    pub fn set_contract_output_selection(
+        &mut self,
+        key: impl Into<String>,
+        values: impl IntoIterator<Item = impl ToString>,
+    ) {
+        self.output_selection
+            .entry("*".to_string())
+            .or_default()
+            .insert(key.into(), values.into_iter().map(|s| s.to_string()).collect());
     }
 
     /// Adds `ast` to output
@@ -201,6 +292,7 @@ impl Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
+            stop_after: None,
             optimizer: Default::default(),
             metadata: None,
             output_selection: Self::default_output_selection(),
@@ -218,6 +310,11 @@ pub struct Optimizer {
     pub enabled: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runs: Option<usize>,
+    /// Switch optimizer components on or off in detail.
+    /// The "enabled" switch above provides two defaults which can be
+    /// tweaked here. If "details" is given, "enabled" can be omitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub details: Option<OptimizerDetails>,
 }
 
 impl Optimizer {
@@ -236,8 +333,61 @@ impl Optimizer {
 
 impl Default for Optimizer {
     fn default() -> Self {
-        Self { enabled: Some(false), runs: Some(200) }
+        Self { enabled: Some(false), runs: Some(200), details: None }
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct OptimizerDetails {
+    /// The peephole optimizer is always on if no details are given,
+    /// use details to switch it off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peephole: Option<bool>,
+    /// The inliner is always on if no details are given,
+    /// use details to switch it off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inliner: Option<bool>,
+    /// The unused jumpdest remover is always on if no details are given,
+    /// use details to switch it off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jumpdest_remover: Option<bool>,
+    /// Sometimes re-orders literals in commutative operations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub order_literals: Option<bool>,
+    /// Removes duplicate code blocks
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deduplicate: Option<bool>,
+    /// Common subexpression elimination, this is the most complicated step but
+    /// can also provide the largest gain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cse: Option<bool>,
+    /// Optimize representation of literal numbers and strings in code.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub constant_optimizer: Option<bool>,
+    /// The new Yul optimizer. Mostly operates on the code of ABI coder v2
+    /// and inline assembly.
+    /// It is activated together with the global optimizer setting
+    /// and can be deactivated here.
+    /// Before Solidity 0.6.0 it had to be activated through this switch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub yul: Option<bool>,
+    /// Tuning options for the Yul optimizer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub yul_details: Option<YulDetails>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct YulDetails {
+    /// Improve allocation of stack slots for variables, can free up stack slots early.
+    /// Activated by default if the Yul optimizer is activated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stack_allocation: Option<bool>,
+    /// Select optimization steps to be applied.
+    /// Optional, the optimizer will use the default sequence if omitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub optimizer_steps: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -324,26 +474,60 @@ impl FromStr for EvmVersion {
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SettingsMetadata {
+    /// Use only literal content and not URLs (false by default)
     #[serde(default, rename = "useLiteralContent", skip_serializing_if = "Option::is_none")]
     pub use_literal_content: Option<bool>,
+    /// Use the given hash method for the metadata hash that is appended to the bytecode.
+    /// The metadata hash can be removed from the bytecode via option "none".
+    /// The other options are "ipfs" and "bzzr1".
+    /// If the option is omitted, "ipfs" is used by default.
     #[serde(default, rename = "bytecodeHash", skip_serializing_if = "Option::is_none")]
     pub bytecode_hash: Option<String>,
 }
 
+/// Bindings for [`solc` contract metadata](https://docs.soliditylang.org/en/latest/metadata.html)
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Metadata {
     pub compiler: Compiler,
     pub language: String,
     pub output: Output,
-    pub settings: Settings,
+    pub settings: MetadataSettings,
     pub sources: MetadataSources,
     pub version: i64,
 }
 
+/// Compiler settings
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MetadataSettings {
+    /// Required for Solidity: File and name of the contract or library this metadata is created
+    /// for.
+    #[serde(default, rename = "compilationTarget")]
+    pub compilation_target: BTreeMap<String, String>,
+    #[serde(flatten)]
+    pub inner: Settings,
+}
+
+/// Compilation source files/source units, keys are file names
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MetadataSources {
     #[serde(flatten)]
-    pub inner: BTreeMap<String, serde_json::Value>,
+    pub inner: BTreeMap<String, MetadataSource>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MetadataSource {
+    /// Required: keccak256 hash of the source file
+    pub keccak256: String,
+    /// Required (unless "content" is used, see below): Sorted URL(s)
+    /// to the source file, protocol is more or less arbitrary, but a
+    /// Swarm URL is recommended
+    #[serde(default)]
+    pub urls: Vec<String>,
+    /// Required (unless "url" is used): literal contents of the source file
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+    /// Optional: SPDX license identifier as given in the source file
+    pub license: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -547,22 +731,7 @@ impl CompilerOutput {
         })
     }
 
-    pub fn diagnostics<'a>(&'a self, ignored_error_codes: &'a [u64]) -> OutputDiagnostics {
-        OutputDiagnostics { compiler_output: self, ignored_error_codes }
-    }
-
     /// Finds the _first_ contract with the given name
-    ///
-    /// # Example
-    ///
-    /// ```
-    /// use ethers_solc::Project;
-    /// use ethers_solc::artifacts::*;
-    /// # fn demo(project: Project) {
-    /// let output = project.compile().unwrap().output();
-    /// let contract = output.find("Greeter").unwrap();
-    /// # }
-    /// ```
     pub fn find(&self, contract: impl AsRef<str>) -> Option<CompactContractRef> {
         let contract_name = contract.as_ref();
         self.contracts_iter().find_map(|(name, contract)| {
@@ -571,17 +740,6 @@ impl CompilerOutput {
     }
 
     /// Finds the first contract with the given name and removes it from the set
-    ///
-    /// # Example
-    ///
-    /// ```
-    /// use ethers_solc::Project;
-    /// use ethers_solc::artifacts::*;
-    /// # fn demo(project: Project) {
-    /// let mut output = project.compile().unwrap().output();
-    /// let contract = output.remove("Greeter").unwrap();
-    /// # }
-    /// ```
     pub fn remove(&mut self, contract: impl AsRef<str>) -> Option<Contract> {
         let contract_name = contract.as_ref();
         self.contracts.values_mut().find_map(|c| c.remove(contract_name))
@@ -608,18 +766,24 @@ impl CompilerOutput {
 
     /// Returns the output's source files and contracts separately, wrapped in helper types that
     /// provide several helper methods
-    ///
-    /// # Example
-    ///
-    /// ```
-    /// use ethers_solc::Project;
-    /// # fn demo(project: Project) {
-    /// let output = project.compile().unwrap().output();
-    /// let (sources, contracts) = output.split();
-    /// # }
-    /// ```
     pub fn split(self) -> (SourceFiles, OutputContracts) {
         (SourceFiles(self.sources), OutputContracts(self.contracts))
+    }
+
+    /// Retains only those files the given iterator yields
+    ///
+    /// In other words, removes all contracts for files not included in the iterator
+    pub fn retain_files<'a, I>(&mut self, files: I)
+    where
+        I: IntoIterator<Item = &'a str>,
+    {
+        let files: HashSet<_> = files.into_iter().collect();
+
+        self.contracts.retain(|f, _| files.contains(f.as_str()));
+        self.sources.retain(|f, _| files.contains(f.as_str()));
+        self.errors.retain(|err| {
+            err.source_location.as_ref().map(|s| files.contains(s.file.as_str())).unwrap_or(true)
+        });
     }
 }
 
@@ -629,17 +793,6 @@ pub struct OutputContracts(pub Contracts);
 
 impl OutputContracts {
     /// Returns an iterator over all contracts and their source names.
-    ///
-    /// ```
-    /// use std::collections::BTreeMap;
-    /// use ethers_solc::{ artifacts::*, Artifact };
-    /// # fn demo(contracts: OutputContracts) {
-    /// let contracts: BTreeMap<String, CompactContractSome> = contracts
-    ///     .into_contracts()
-    ///     .map(|(k, c)| (k, c.into_compact_contract().unwrap()))
-    ///     .collect();
-    /// # }
-    /// ```
     pub fn into_contracts(self) -> impl Iterator<Item = (String, Contract)> {
         self.0.into_values().flatten()
     }
@@ -650,17 +803,6 @@ impl OutputContracts {
     }
 
     /// Finds the _first_ contract with the given name
-    ///
-    /// # Example
-    ///
-    /// ```
-    /// use ethers_solc::Project;
-    /// use ethers_solc::artifacts::*;
-    /// # fn demo(project: Project) {
-    /// let output = project.compile().unwrap().output();
-    /// let contract = output.find("Greeter").unwrap();
-    /// # }
-    /// ```
     pub fn find(&self, contract: impl AsRef<str>) -> Option<CompactContractRef> {
         let contract_name = contract.as_ref();
         self.contracts_iter().find_map(|(name, contract)| {
@@ -669,94 +811,24 @@ impl OutputContracts {
     }
 
     /// Finds the first contract with the given name and removes it from the set
-    ///
-    /// # Example
-    ///
-    /// ```
-    /// use ethers_solc::Project;
-    /// use ethers_solc::artifacts::*;
-    /// # fn demo(project: Project) {
-    /// let (_, mut contracts) = project.compile().unwrap().output().split();
-    /// let contract = contracts.remove("Greeter").unwrap();
-    /// # }
-    /// ```
     pub fn remove(&mut self, contract: impl AsRef<str>) -> Option<Contract> {
         let contract_name = contract.as_ref();
         self.0.values_mut().find_map(|c| c.remove(contract_name))
     }
 }
 
-/// Helper type to implement display for solc errors
-#[derive(Clone, Debug)]
-pub struct OutputDiagnostics<'a> {
-    compiler_output: &'a CompilerOutput,
-    ignored_error_codes: &'a [u64],
-}
-
-impl<'a> OutputDiagnostics<'a> {
-    /// Returns true if there is at least one error of high severity
-    pub fn has_error(&self) -> bool {
-        self.compiler_output.has_error()
-    }
-
-    /// Returns true if there is at least one warning
-    pub fn has_warning(&self) -> bool {
-        self.compiler_output.has_warning(self.ignored_error_codes)
-    }
-
-    fn is_test<T: AsRef<str>>(&self, contract_path: T) -> bool {
-        if contract_path.as_ref().ends_with(".t.sol") {
-            return true
-        }
-
-        self.compiler_output.find(&contract_path).map_or(false, |contract| {
-            contract.abi.map_or(false, |abi| abi.functions.contains_key("IS_TEST"))
-        })
-    }
-}
-
-impl<'a> fmt::Display for OutputDiagnostics<'a> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self.has_error() {
-            f.write_str("Compiler run failed")?;
-        } else if self.has_warning() {
-            f.write_str("Compiler run successful (with warnings)")?;
-        } else {
-            f.write_str("Compiler run successful")?;
-        }
-        for err in &self.compiler_output.errors {
-            if err.severity.is_warning() {
-                let is_ignored = err.error_code.as_ref().map_or(false, |code| {
-                    if let Some(source_location) = &err.source_location {
-                        // we ignore spdx and contract size warnings in test
-                        // files. if we are looking at one of these warnings
-                        // from a test file we skip
-                        if self.is_test(&source_location.file) && (*code == 1878 || *code == 5574) {
-                            return true
-                        }
-                    }
-
-                    self.ignored_error_codes.contains(code)
-                });
-
-                if !is_ignored {
-                    writeln!(f, "\n{}", err)?;
-                }
-            } else {
-                writeln!(f, "\n{}", err)?;
-            }
-        }
-        Ok(())
-    }
-}
-
 /// Represents a compiled solidity contract
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
 pub struct Contract {
     /// The Ethereum Contract Metadata.
     /// See https://docs.soliditylang.org/en/develop/metadata.html
     pub abi: Option<Abi>,
-    #[serde(default, skip_serializing_if = "Option::is_none", with = "json_string_opt")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "serde_helpers::json_string_opt"
+    )]
     pub metadata: Option<Metadata>,
     #[serde(default)]
     pub userdoc: UserDoc,
@@ -764,7 +836,7 @@ pub struct Contract {
     pub devdoc: DevDoc,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ir: Option<String>,
-    #[serde(default, rename = "storageLayout", skip_serializing_if = "StorageLayout::is_empty")]
+    #[serde(default, skip_serializing_if = "StorageLayout::is_empty")]
     pub storage_layout: StorageLayout,
     /// EVM-related outputs
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -772,6 +844,8 @@ pub struct Contract {
     /// Ewasm related outputs
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ewasm: Option<Ewasm>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ir_optimized: Option<String>,
 }
 
 /// Minimal representation of a contract with a present abi and bytecode.
@@ -847,7 +921,7 @@ impl From<Contract> for ContractBytecode {
 ///
 /// Unlike `CompactContractSome` which contains the `BytecodeObject`, this holds the whole
 /// `Bytecode` object.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct CompactContractBytecode {
     /// The Ethereum Contract ABI. If empty, it is represented as an empty
     /// array. See https://docs.soliditylang.org/en/develop/abi-spec.html
@@ -1045,6 +1119,12 @@ impl From<serde_json::Value> for CompactContract {
         } else {
             CompactContract::default()
         }
+    }
+}
+
+impl From<serde_json::Value> for CompactContractBytecode {
+    fn from(val: serde_json::Value) -> Self {
+        serde_json::from_value(val).unwrap_or_default()
     }
 }
 
@@ -1444,7 +1524,7 @@ impl Bytecode {
 #[serde(untagged)]
 pub enum BytecodeObject {
     /// Fully linked bytecode object
-    #[serde(deserialize_with = "deserialize_bytes")]
+    #[serde(deserialize_with = "serde_helpers::deserialize_bytes")]
     Bytecode(Bytes),
     /// Bytecode as hex string that's not fully linked yet and contains library placeholders
     Unlinked(String),
@@ -1694,7 +1774,7 @@ pub struct Ewasm {
 #[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
 pub struct StorageLayout {
     pub storage: Vec<Storage>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "serde_helpers::default_for_null")]
     pub types: BTreeMap<String, StorageType>,
 }
 
@@ -1724,17 +1804,17 @@ pub struct StorageType {
     pub number_of_bytes: String,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq, Hash)]
 #[serde(rename_all = "camelCase")]
 pub struct Error {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_location: Option<SourceLocation>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub secondary_source_locations: Vec<SourceLocation>,
+    pub secondary_source_locations: Vec<SecondarySourceLocation>,
     pub r#type: String,
     pub component: String,
     pub severity: Severity,
-    #[serde(default, with = "display_from_str_opt")]
+    #[serde(default, with = "serde_helpers::display_from_str_opt")]
     pub error_code: Option<u64>,
     pub message: String,
     pub formatted_message: Option<String>,
@@ -1754,7 +1834,7 @@ impl fmt::Display for Error {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub enum Severity {
     Error,
     Warning,
@@ -1837,11 +1917,18 @@ impl<'de> Deserialize<'de> for Severity {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq, Hash)]
 pub struct SourceLocation {
     pub file: String,
     pub start: i32,
     pub end: i32,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq, Hash)]
+pub struct SecondarySourceLocation {
+    pub file: Option<String>,
+    pub start: Option<i32>,
+    pub end: Option<i32>,
     pub message: Option<String>,
 }
 
@@ -1857,7 +1944,7 @@ pub struct SourceFile {
 pub struct SourceFiles(pub BTreeMap<String, SourceFile>);
 
 impl SourceFiles {
-    /// Returns an iterator over the the source files' ids and path
+    /// Returns an iterator over the source files' ids and path
     ///
     /// ```
     /// use std::collections::BTreeMap;
@@ -1881,102 +1968,6 @@ impl SourceFiles {
     /// ```
     pub fn into_paths(self) -> impl Iterator<Item = (String, u32)> {
         self.0.into_iter().map(|(k, v)| (k, v.id))
-    }
-}
-
-mod display_from_str_opt {
-    use serde::{de, Deserialize, Deserializer, Serializer};
-    use std::{fmt, str::FromStr};
-
-    pub fn serialize<T, S>(value: &Option<T>, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        T: fmt::Display,
-        S: Serializer,
-    {
-        if let Some(value) = value {
-            serializer.collect_str(value)
-        } else {
-            serializer.serialize_none()
-        }
-    }
-
-    pub fn deserialize<'de, T, D>(deserializer: D) -> Result<Option<T>, D::Error>
-    where
-        D: Deserializer<'de>,
-        T: FromStr,
-        T::Err: fmt::Display,
-    {
-        if let Some(s) = Option::<String>::deserialize(deserializer)? {
-            s.parse().map_err(de::Error::custom).map(Some)
-        } else {
-            Ok(None)
-        }
-    }
-}
-
-mod json_string_opt {
-    use serde::{
-        de::{self, DeserializeOwned},
-        ser, Deserialize, Deserializer, Serialize, Serializer,
-    };
-
-    pub fn serialize<T, S>(value: &Option<T>, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-        T: Serialize,
-    {
-        if let Some(value) = value {
-            let value = serde_json::to_string(value).map_err(ser::Error::custom)?;
-            serializer.serialize_str(&value)
-        } else {
-            serializer.serialize_none()
-        }
-    }
-
-    pub fn deserialize<'de, T, D>(deserializer: D) -> Result<Option<T>, D::Error>
-    where
-        D: Deserializer<'de>,
-        T: DeserializeOwned,
-    {
-        if let Some(s) = Option::<String>::deserialize(deserializer)? {
-            serde_json::from_str(&s).map_err(de::Error::custom).map(Some)
-        } else {
-            Ok(None)
-        }
-    }
-}
-
-pub fn deserialize_bytes<'de, D>(d: D) -> std::result::Result<Bytes, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let value = String::deserialize(d)?;
-    if let Some(value) = value.strip_prefix("0x") {
-        hex::decode(value)
-    } else {
-        hex::decode(&value)
-    }
-    .map(Into::into)
-    .map_err(|e| serde::de::Error::custom(e.to_string()))
-}
-
-pub fn deserialize_opt_bytes<'de, D>(d: D) -> std::result::Result<Option<Bytes>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let value = Option::<String>::deserialize(d)?;
-    if let Some(value) = value {
-        Ok(Some(
-            if let Some(value) = value.strip_prefix("0x") {
-                hex::decode(value)
-            } else {
-                hex::decode(&value)
-            }
-            .map_err(|e| serde::de::Error::custom(e.to_string()))?
-            .into(),
-        ))
-    } else {
-        Ok(None)
     }
 }
 
